@@ -1,0 +1,106 @@
+name: Watchdog for coin news checker
+
+# Runs independently of "Check NBU coin news" and reports when that workflow
+# has stopped actually running - either because a run failed silently before
+# reaching its own failure-notification step, or because GitHub disabled the
+# schedule (e.g. after 60 days without repository activity, or a manual
+# disable). A plain "if: failure()" step inside the monitored workflow can't
+# catch that second case, since a disabled workflow never runs at all.
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  actions: read
+
+env:
+  MONITORED_WORKFLOW: check-coin-news.yml
+  # 6x the monitored workflow's 15-minute interval, to absorb the
+  # occasional scheduling delay GitHub documents for cron-triggered runs.
+  STALE_THRESHOLD_MINUTES: 90
+  # Alert when this many most-recent completed runs failed back to back.
+  # A single failure is often a transient network blip that the next run
+  # recovers from on its own, so alerting on one would just be noise.
+  CONSECUTIVE_FAILURES_TO_ALERT: 3
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check monitored workflow health
+        id: health
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo="${{ github.repository }}"
+          workflow_info=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}")
+          state=$(echo "$workflow_info" | jq -r '.state')
+
+          # Fetch several recent runs, not just one: the freshness check only
+          # needs the latest, but spotting "it runs every 15 minutes and fails
+          # every single time" needs a few in a row.
+          runs=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs?per_page=${CONSECUTIVE_FAILURES_TO_ALERT}")
+          run_count=$(echo "$runs" | jq -r '.total_count')
+
+          if [ "$run_count" -eq 0 ]; then
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' has never run yet." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          last_created_at=$(echo "$runs" | jq -r '.workflow_runs[0].created_at')
+          last_conclusion=$(echo "$runs" | jq -r '.workflow_runs[0].conclusion // "in_progress"')
+
+          # Count how many of the most recent *completed* runs failed in a row.
+          failed_streak=$(echo "$runs" | jq -r '
+            [.workflow_runs[] | select(.conclusion != null)]
+            | map(.conclusion)
+            | (index("success") // length)
+          ')
+          completed_count=$(echo "$runs" | jq -r '[.workflow_runs[] | select(.conclusion != null)] | length')
+
+          last_epoch=$(date -d "$last_created_at" +%s)
+          now_epoch=$(date -u +%s)
+          minutes_since=$(( (now_epoch - last_epoch) / 60 ))
+
+          echo "State: $state, last run: $last_created_at (${minutes_since} min ago, conclusion: $last_conclusion)"
+          echo "Consecutive failures among ${completed_count} completed runs: ${failed_streak}"
+
+          if [ "$state" != "active" ]; then
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' is not active (state: ${state}). GitHub may have auto-disabled it after 60 days without repository activity - re-enable it from the Actions tab." >> "$GITHUB_OUTPUT"
+          elif [ "$minutes_since" -gt "$STALE_THRESHOLD_MINUTES" ]; then
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't run in ${minutes_since} minutes (expected every 15). Last conclusion: ${last_conclusion}." >> "$GITHUB_OUTPUT"
+          elif [ "$completed_count" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ] && [ "$failed_streak" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ]; then
+            # The workflow is running on schedule but every recent run failed.
+            # Its own failure notification may be exactly what is broken (bad
+            # bot token, revoked chat), so this alert is the only safety net.
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' is running on schedule but its last ${failed_streak} runs all failed. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/${MONITORED_WORKFLOW}" >> "$GITHUB_OUTPUT"
+          else
+            echo "alert=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Telegram alert
+        if: steps.health.outputs.alert == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_RECIPIENTS: ${{ secrets.TELEGRAM_RECIPIENTS }}
+          ALERT_MESSAGE: ${{ steps.health.outputs.message }}
+        run: |
+          recipients="${TELEGRAM_RECIPIENTS:-${TELEGRAM_BOT_TOKEN}:${TELEGRAM_CHAT_ID}}"
+          echo "$recipients" | tr ',' '\n' | while IFS= read -r entry; do
+            entry="$(echo "$entry" | tr -d '[:space:]')"
+            [ -z "$entry" ] && continue
+            token="${entry%:*}"
+            chat_id="${entry##*:}"
+            curl -sS -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+              --data-urlencode "chat_id=${chat_id}" \
+              --data-urlencode "text=${ALERT_MESSAGE}"
+          done

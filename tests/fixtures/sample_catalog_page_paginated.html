@@ -1,0 +1,40 @@
+<!--
+    Trimmed excerpt of a catalog page that has more items than fit on one
+    page, modelled on the real pagination_block markup seen on
+    https://coins.bank.gov.ua/arhiv/c-457.html (the only category page big
+    enough to paginate in practice) - used to test find_next_page_url.
+-->
+<!DOCTYPE html>
+<html lang="uk">
+<body>
+<div id="block">
+    <div class="row row_catalog_products " id="r_spisok">
+        <div class="col-xl-4 col-lg-4 col-md-4 col-sm-6 col-xs-6 col_product col_product_bank">
+            <div class="product ">
+                <div class="p_description">
+                    <a class="p_img_href  not-slider" href="/-bosporske-carstvo-u-phutljari/p-885.html">
+                        <img src="pixel.png" data-src="bospor.webp" alt="&quot;Боспорське царство&quot; у футлярі" />
+                    </a>
+                    <div class="product__name">
+                        <a href="/-bosporske-carstvo-u-phutljari/p-885.html" class="model_product">&quot;Боспорське царство&quot; у футлярі</a>
+                        <span class="new_price">235   447 грн</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="pagination_block">
+        <button class="btn btn-primary" id="loadMoreProducts">Показати ще</button>
+        <div class="pagination_list clearfix">
+            <nav>
+                <ul class="pagination pagination-sm">
+                    <li class="active"><span href="#" onclick="return false">1</span></li>
+                    <li><a rel="next" href="https://coins.bank.gov.ua/catalog.html?page=2" title=" Сторінка 2 ">2</a></li>
+                    <li><a rel="next" class="next_page" href="https://coins.bank.gov.ua/catalog.html?page=2" title=" Наступна сторінка ">ДАЛІ</a></li>
+                </ul>
+            </nav>
+        </div>
+    </div>
+</div>
+</body>
+</html>

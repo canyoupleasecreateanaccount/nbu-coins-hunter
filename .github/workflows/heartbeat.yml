@@ -1,0 +1,50 @@
+name: Heartbeat
+
+# Makes one trivial commit a month so the repository never goes fully
+# quiet. GitHub automatically disables schedule-triggered workflows after
+# about 60 days without any repository activity - which would otherwise
+# silently stop both check-coin-news.yml and watchdog.yml (also scheduled)
+# with nothing left running to notice or fix it. A monthly commit keeps
+# every scheduled workflow here alive indefinitely, without depending on
+# new coin news actually being published.
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# Shares one group with check-coin-news.yml: both push commits to the same
+# branch, and the monthly heartbeat would otherwise be able to land right
+# between that workflow's `git pull --rebase` and its `git push`, failing
+# one of the two runs for no real reason.
+concurrency:
+  group: repo-state-commit
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record heartbeat timestamp
+        run: |
+          mkdir -p state
+          printf '{\n  "last_heartbeat_utc": "%s"\n}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > state/heartbeat.json
+
+      - name: Commit heartbeat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/heartbeat.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Monthly heartbeat commit [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          else
+            echo "No heartbeat change to commit."
+          fi

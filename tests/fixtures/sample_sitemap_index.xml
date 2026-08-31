@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap>
+    <loc>https://coins.bank.gov.ua/sitemapproducts.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://coins.bank.gov.ua/sitemapcategories.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://coins.bank.gov.ua/sitemaparticles.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://coins.bank.gov.ua/sitemapimages.xml</loc>
+  </sitemap>
+</sitemapindex>
