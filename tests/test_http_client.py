@@ -123,16 +123,74 @@ def test_get_retries_on_connection_error():
     assert client.session.calls == 2
 
 
+def test_parse_plain_proxy_list_strips_scheme_prefix_and_blank_lines():
+    text = "1.2.3.4:8080\nsocks5://5.6.7.8:1080\n\n  \n"
+
+    assert http_client.parse_plain_proxy_list(text) == {"1.2.3.4:8080", "5.6.7.8:1080"}
+
+
+class FakeJsonResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_fetch_geonode_candidates_excludes_entries_tagged_with_an_excluded_country(monkeypatch):
+    payload = {
+        "data": [
+            {"ip": "1.1.1.1", "port": "8080", "country": "US"},
+            {"ip": "2.2.2.2", "port": "3128", "country": "RU"},
+            {"ip": "3.3.3.3", "port": "80", "country": "DE"},
+        ]
+    }
+    monkeypatch.setattr(http_client.requests, "get", lambda *a, **kw: FakeJsonResponse(payload))
+
+    candidates = http_client.fetch_geonode_candidates(excluded_ips=set())
+
+    assert candidates == {"1.1.1.1:8080", "3.3.3.3:80"}
+
+
+def test_fetch_geonode_candidates_also_excludes_ips_from_the_dedicated_country_list(monkeypatch):
+    # Geonode's own "country" tag is not the only signal used - an IP
+    # named by the dedicated per-country list is excluded even if Geonode
+    # itself tags it as something else (e.g. a proxy tunnelled abroad).
+    payload = {"data": [{"ip": "9.9.9.9", "port": "80", "country": "DE"}]}
+    monkeypatch.setattr(http_client.requests, "get", lambda *a, **kw: FakeJsonResponse(payload))
+
+    candidates = http_client.fetch_geonode_candidates(excluded_ips={"9.9.9.9"})
+
+    assert candidates == set()
+
+
 CHALLENGE_RESPONSE = (403, {"CDN-Challenge": "true", "ErrorCode": "112"})
+PLAIN_BLOCK_RESPONSE = (403, {})
 
 
-def test_get_falls_back_to_solving_the_challenge_and_succeeds(capsys):
+def test_get_falls_back_to_a_proxy_and_succeeds_without_touching_the_browser():
+    # A working free proxy sidesteps the block entirely - no need to ever
+    # reach for the (much heavier) headless-browser fallback.
+    client, _ = make_client([CHALLENGE_RESPONSE] * http_client.MAX_ATTEMPTS)
+    client._find_working_proxy = lambda url: FakeResponse(200)
+    client._solve_challenge = lambda url: pytest.fail("should not be called when a proxy already worked")
+
+    resp = client.get("https://example.com")
+
+    assert resp.status_code == 200
+
+
+def test_get_falls_back_to_solving_the_challenge_when_no_proxy_works(capsys):
     # A real Bunny Shield challenge page still comes back as HTTP 403, but
     # tagged with this header. A plain HTTP client can never solve it by
-    # retrying, so get() should fall back to _solve_challenge() instead -
-    # faked out here so the test never touches a real browser - and then
-    # try the request again.
+    # retrying, so once no free proxy works either, get() should fall back
+    # to _solve_challenge() - faked out here so the test never touches a
+    # real browser - and then try the request again.
     client, _ = make_client([CHALLENGE_RESPONSE] * http_client.MAX_ATTEMPTS)
+    client._find_working_proxy = lambda url: None
     solved_with = []
     client._solve_challenge = solved_with.append
 
@@ -146,17 +204,32 @@ def test_get_falls_back_to_solving_the_challenge_and_succeeds(capsys):
     assert "solving Bunny Shield's JS challenge" in capsys.readouterr().out
 
 
-def test_get_raises_if_challenge_persists_after_solving_attempt():
+def test_get_raises_if_challenge_persists_after_every_fallback():
     # The challenge-solving fallback only gets one try per get() call - if
     # the site still challenges every request afterwards (e.g. the
     # headless browser also got blocked), this must not retry forever.
     client, _ = make_client([CHALLENGE_RESPONSE] * (http_client.MAX_ATTEMPTS * 2))
+    client._find_working_proxy = lambda url: None
     client._solve_challenge = lambda url: None
 
-    with pytest.raises(http_client.BunnyShieldChallenge):
+    with pytest.raises(http_client.BunnyShieldBlocked):
         client.get("https://example.com")
 
     assert client.session.calls == http_client.MAX_ATTEMPTS * 2
+
+
+def test_get_does_not_try_the_browser_for_a_plain_block_with_no_challenge():
+    # A plain 403 with no CDN-Challenge header is not a JS challenge - a
+    # headless browser cannot do anything a plain request could not, so
+    # it should never even be attempted; only the proxy fallback can help.
+    client, _ = make_client([PLAIN_BLOCK_RESPONSE] * http_client.MAX_ATTEMPTS)
+    client._find_working_proxy = lambda url: None
+    client._solve_challenge = lambda url: pytest.fail("should not be called for a plain block")
+
+    with pytest.raises(http_client.BunnyShieldBlocked) as exc_info:
+        client.get("https://example.com")
+
+    assert exc_info.value.is_js_challenge is False
 
 
 def test_get_does_not_retry_on_404():
