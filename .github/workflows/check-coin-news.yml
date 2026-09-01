@@ -2,7 +2,12 @@ name: Check NBU coin news
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Offset from round minutes (:00/:05/:15/:30/...) on purpose: those are
+    # the most congested times for scheduled GitHub Actions runs worldwide
+    # (GitHub's own docs call out "the start of every hour" specifically),
+    # so a plain "*/15" is more likely to be delayed than an odd offset
+    # like this one. Same ~15-minute cadence either way.
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch: {}
 
 permissions:
