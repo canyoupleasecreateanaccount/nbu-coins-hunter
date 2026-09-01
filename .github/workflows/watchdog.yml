@@ -9,7 +9,9 @@ name: Watchdog for coin news checker
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    # Offset off :00 for the same reason as check-coin-news.yml's schedule:
+    # round minutes are GitHub's busiest scheduling slots.
+    - cron: '11 */3 * * *'
   workflow_dispatch: {}
 
 permissions:

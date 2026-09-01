@@ -153,7 +153,7 @@ scripts/
   check_news.py         # перевірка сторінки новин
   check_sitemap.py      # перевірка sitemap.xml (раннє попередження)
   check_lots.py         # перевірка каталогу (що можна купити прямо зараз)
-  http_client.py        # сесія, паузи й ретраї (сайт за bot-захистом)
+  http_client.py        # сесія, паузи й ретраї + fallback на проксі/браузер
   telegram_notify.py    # спільне форматування й надсилання в Telegram
   requirements.txt
   requirements-dev.txt
