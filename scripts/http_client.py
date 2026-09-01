@@ -33,13 +33,15 @@ retry still gets refused with HTTP 403, the client falls back to:
    way, but trying up to a couple hundred (pooled from several public
    lists, several in flight at once, Russian-hosted ones filtered out)
    usually turns up one that is not, which sidesteps the IP-based block
-   entirely.
-2. Only if that fails and the block was specifically the JS challenge (not
-   a plain block, which a browser cannot do anything about either):
-   solving it once with a headless browser (Playwright/Chromium) and
-   copying the resulting cookies into the same session, so every actual
-   page fetch - including non-HTML ones like sitemap.xml - still goes
-   through plain, fast `requests` calls rather than a full browser.
+   entirely. Free proxies are flaky, so an adopted one that later stops
+   working mid-run is dropped and replaced from the same pool (see
+   `get()`) rather than failing the run outright.
+2. Only if no proxy is left working and the block was specifically the JS
+   challenge (not a plain block, which a browser cannot do anything about
+   either): solving it once with a headless browser (Playwright/Chromium)
+   and copying the resulting cookies into the same session, so every
+   actual page fetch - including non-HTML ones like sitemap.xml - still
+   goes through plain, fast `requests` calls rather than a full browser.
 """
 
 from __future__ import annotations
@@ -114,12 +116,30 @@ RUSSIAN_PROXY_LIST_URL = "https://raw.githubusercontent.com/iplocate/free-proxy-
 #: Russian will not be caught.
 EXCLUDED_PROXY_COUNTRIES = {"RU"}
 
-#: How many candidates to try before giving up. In testing, only about
+#: How many untested candidates to try per batch. In testing, only about
 #: 1-3% of pooled candidates both work at all *and* get past this site's
-#: shield, so finding one reliably needs a wide net.
+#: shield, so finding one reliably needs a wide net. A client works
+#: through the pool in batches of this size (see SiteClient._next_proxy_batch)
+#: rather than all at once, since a proxy that tests fine can still go bad
+#: partway through a run - the leftover, not-yet-tried candidates are what
+#: makes recovering from that possible without refetching the lists.
 MAX_PROXY_CANDIDATES = 200
 PROXY_TEST_TIMEOUT_SECONDS = 8
 PROXY_TEST_CONCURRENCY = 15
+
+#: How many fresh batches of untested proxies to work through - in the
+#: initial search and again each time an adopted proxy later goes bad -
+#: before giving up on the proxy route entirely for a given request.
+MAX_PROXY_BATCHES = 3
+
+#: Once routed through an already-adopted proxy, a lower timeout and
+#: attempt count than the direct-request defaults: a genuinely working
+#: proxy responds quickly (it just proved that during selection), and
+#: backing off to retry the *same* dead proxy rarely helps the way it
+#: does for a real rate limit - abandoning it for a different one (see
+#: SiteClient.get) is more productive than waiting it out.
+PROXY_REQUEST_TIMEOUT_SECONDS = 10
+MAX_PROXY_REQUEST_ATTEMPTS = 2
 
 
 def build_headers(user_agent: str) -> dict[str, str]:
@@ -178,8 +198,13 @@ def fetch_geonode_candidates(excluded_ips: set[str]) -> set[str]:
     return candidates
 
 
-def fetch_candidate_proxies(limit: int = MAX_PROXY_CANDIDATES) -> list[str]:
-    """Return a shuffled sample of "ip:port" candidates pooled from several free proxy list sources.
+def fetch_candidate_proxies() -> list[str]:
+    """Return every "ip:port" candidate pooled from several free proxy list sources, shuffled.
+
+    Not limited to any particular count: a SiteClient works through the
+    result in batches (see ``SiteClient._next_proxy_batch``), so the whole
+    pool stays available to recover from a proxy that goes bad partway
+    through a run, not just the first attempt.
 
     See EXCLUDED_PROXY_COUNTRIES for why some candidates never make it in.
     A source that fails to load (network hiccup, format change, ...) is
@@ -201,7 +226,7 @@ def fetch_candidate_proxies(limit: int = MAX_PROXY_CANDIDATES) -> list[str]:
 
     candidates = list(candidates)
     random.shuffle(candidates)
-    return candidates[:limit]
+    return candidates
 
 
 class BunnyShieldBlocked(requests.HTTPError):
@@ -237,7 +262,8 @@ class SiteClient:
         self._sleep = sleep
         self._last_request_at: float | None = None
         self._challenge_solved = False
-        self._proxy_search_done = False
+        self._proxy_pool: list[str] | None = None
+        self._tried_proxies: set[str] = set()
 
     def _wait_between_requests(self) -> None:
         """Sleep just enough that consecutive requests stay politely spaced."""
@@ -248,7 +274,7 @@ class SiteClient:
         if remaining > 0:
             self._sleep(remaining)
 
-    def _get_with_retries(self, url: str, timeout: int) -> requests.Response:
+    def _get_with_retries(self, url: str, timeout: int, max_attempts: int = MAX_ATTEMPTS) -> requests.Response:
         """GET ``url``, retrying with exponential backoff on shield/transient errors.
 
         Raises BunnyShieldBlocked if the last attempt is still refused with
@@ -258,9 +284,9 @@ class SiteClient:
         """
         backoff = INITIAL_BACKOFF_SECONDS
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             self._wait_between_requests()
-            is_last_attempt = attempt == MAX_ATTEMPTS
+            is_last_attempt = attempt == max_attempts
             reason: str | None = None
 
             try:
@@ -289,28 +315,45 @@ class SiteClient:
                     return resp
                 reason = f"HTTP {resp.status_code}"
 
-            print(f"  {url} -> {reason}, retry {attempt}/{MAX_ATTEMPTS - 1} in {backoff:.1f}s")
+            print(f"  {url} -> {reason}, retry {attempt}/{max_attempts - 1} in {backoff:.1f}s")
             self._sleep(backoff + random.uniform(0, 1))
             backoff *= 2
 
         raise RuntimeError(f"Failed to fetch {url}")
 
+    def _next_proxy_batch(self) -> list[str]:
+        """Return up to MAX_PROXY_CANDIDATES not-yet-tried proxies from the shared pool.
+
+        Fetches the full pool once per client (cached in ``_proxy_pool``)
+        and remembers every candidate ever handed out here (``_tried_proxies``),
+        successful or not, so later calls - e.g. because a previously
+        adopted proxy went bad on a later request - make progress through
+        fresh candidates instead of re-testing dead ones. Returns an empty
+        list once the whole pool has been exhausted.
+        """
+        if self._proxy_pool is None:
+            try:
+                self._proxy_pool = fetch_candidate_proxies()
+            except requests.RequestException:
+                self._proxy_pool = []
+
+        untested = [candidate for candidate in self._proxy_pool if candidate not in self._tried_proxies]
+        batch = untested[:MAX_PROXY_CANDIDATES]
+        self._tried_proxies.update(batch)
+        return batch
+
     def _find_working_proxy(self, url: str) -> requests.Response | None:
-        """Try free public proxies concurrently until one can fetch ``url``, and adopt it.
+        """Try untested free public proxies concurrently until one can fetch ``url``, and adopt it.
 
         Tests candidates against the real ``url`` (not a throwaway probe),
         so the first one that works has already fetched what we needed -
         its response is returned directly. Leaves this client's session
-        using that same proxy for the rest of the run. Returns None if
-        none of the candidates worked, which is the common case.
+        using that same proxy for the rest of the run (until ``get()``
+        notices it stopped working and calls this again). Returns None if
+        none of the batch worked, which is the common case.
         """
-        if self._proxy_search_done:
-            return None
-        self._proxy_search_done = True
-
-        try:
-            candidates = fetch_candidate_proxies()
-        except requests.RequestException:
+        candidates = self._next_proxy_batch()
+        if not candidates:
             return None
 
         def try_candidate(candidate: str) -> tuple[str, requests.Response] | None:
@@ -385,30 +428,59 @@ class SiteClient:
     def get(self, url: str, timeout: int = 30) -> requests.Response:
         """GET ``url``, retrying on shield/transient errors and falling back if every retry is blocked.
 
-        On a persistent HTTP 403, tries a free proxy first (works for
-        either a plain block or a JS challenge, since it sidesteps the
-        blocked IP entirely), then - only for a JS challenge, since a
-        headless browser cannot do anything about a plain block either -
-        solves the challenge and retries once more directly.
+        If this client already adopted a working proxy for an earlier
+        call, that is tried first (a lower timeout/attempt budget than a
+        direct request, since a genuinely working proxy responds quickly,
+        and a dead one is more productive to abandon than to wait out).
+        Free proxies are flaky, so one that worked before can still stop
+        working mid-run - when that happens, it is dropped and a
+        replacement is searched for, same as if there had been no proxy
+        at all.
+
+        On a persistent HTTP 403 with no (or no more) working proxy
+        available, falls back to a headless browser - but only for a JS
+        challenge specifically, since a browser cannot do anything a
+        proxy-less plain block either.
 
         Raises the final ``requests.HTTPError`` (or connection error) if
         every attempt still fails, so a persistently blocked run fails
         loudly rather than silently returning nothing to parse.
         """
-        try:
-            return self._get_with_retries(url, timeout)
-        except BunnyShieldBlocked as exc:
-            # Python deletes the "as exc" name once the except block ends,
-            # so it is reassigned here to stay usable below.
-            blocked = exc
-            print(f"  {url} -> {blocked}, trying a free public proxy...")
+        is_challenge: bool | None
+        if self.session.proxies:
+            try:
+                return self._get_with_retries(
+                    url, PROXY_REQUEST_TIMEOUT_SECONDS, max_attempts=MAX_PROXY_REQUEST_ATTEMPTS
+                )
+            except (BunnyShieldBlocked, requests.RequestException) as exc:
+                print(f"  {url} -> the adopted proxy stopped working ({type(exc).__name__}), looking for another...")
+                self.session.proxies = {}
+            # Unknown here: the failure was proxy-side, not a fresh read of
+            # whether coins.bank.gov.ua itself would even still block us
+            # directly for this URL - resolved below if no proxy is found.
+            is_challenge = None
+        else:
+            try:
+                return self._get_with_retries(url, timeout)
+            except BunnyShieldBlocked as exc:
+                print(f"  {url} -> {exc}, trying a free public proxy...")
+                is_challenge = exc.is_js_challenge
+                last_error = exc
 
-        proxy_resp = self._find_working_proxy(url)
-        if proxy_resp is not None:
-            return proxy_resp
+        for _ in range(MAX_PROXY_BATCHES):
+            proxy_resp = self._find_working_proxy(url)
+            if proxy_resp is not None:
+                return proxy_resp
 
-        if not blocked.is_js_challenge:
-            raise blocked
+        if is_challenge is None:
+            try:
+                return self._get_with_retries(url, timeout)
+            except BunnyShieldBlocked as exc:
+                is_challenge = exc.is_js_challenge
+                last_error = exc
+
+        if not is_challenge:
+            raise last_error
 
         print(f"  {url} -> no working proxy found, solving Bunny Shield's JS challenge with a headless browser...")
         self._solve_challenge(url)

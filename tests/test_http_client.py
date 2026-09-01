@@ -30,6 +30,7 @@ class FakeSession:
         self.statuses = list(statuses)
         self.calls = 0
         self.headers = {}
+        self.proxies = {}
 
     def get(self, url, timeout=None):
         self.calls += 1
@@ -216,6 +217,58 @@ def test_get_raises_if_challenge_persists_after_every_fallback():
         client.get("https://example.com")
 
     assert client.session.calls == http_client.MAX_ATTEMPTS * 2
+
+
+def test_next_proxy_batch_does_not_hand_out_the_same_candidate_twice(monkeypatch):
+    client = http_client.SiteClient(user_agent="test-agent", sleep=lambda _: None)
+    monkeypatch.setattr(http_client, "fetch_candidate_proxies", lambda: ["1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"])
+
+    first_batch = client._next_proxy_batch()
+    second_batch = client._next_proxy_batch()
+
+    assert set(first_batch) == {"1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"}
+    assert second_batch == []
+
+
+def test_get_finds_a_replacement_when_the_adopted_proxy_stops_working(capsys):
+    # Free proxies are flaky: one that worked for an earlier URL in this
+    # same run can still die on a later one. get() must drop it and look
+    # for a replacement instead of letting the connection error crash the
+    # whole run.
+    client, _ = make_client([requests.ConnectionError("proxy died")] * http_client.MAX_PROXY_REQUEST_ATTEMPTS)
+    client.session.proxies = {"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"}
+    searched_with = []
+
+    def fake_find(url):
+        searched_with.append(url)
+        return FakeResponse(200)
+
+    client._find_working_proxy = fake_find
+
+    resp = client.get("https://example.com")
+
+    assert resp.status_code == 200
+    assert searched_with == ["https://example.com"]
+    assert "the adopted proxy stopped working" in capsys.readouterr().out
+
+
+def test_get_falls_back_to_the_browser_after_the_adopted_proxy_dies_with_no_replacement():
+    # Once every proxy has been tried and none works, get() has never
+    # actually re-checked whether coins.bank.gov.ua itself would still
+    # challenge a direct request for this specific URL (it went straight
+    # through the now-dead proxy) - it needs one fresh direct read before
+    # deciding whether a headless browser is even worth trying.
+    statuses = [requests.ConnectionError("proxy died")] + [CHALLENGE_RESPONSE] * (http_client.MAX_ATTEMPTS * 2)
+    client, _ = make_client(statuses)
+    client.session.proxies = {"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"}
+    client._find_working_proxy = lambda url: None
+    solved_with = []
+    client._solve_challenge = solved_with.append
+
+    resp = client.get("https://example.com")
+
+    assert resp.status_code == 200
+    assert solved_with == ["https://example.com"]
 
 
 def test_get_does_not_try_the_browser_for_a_plain_block_with_no_challenge():
