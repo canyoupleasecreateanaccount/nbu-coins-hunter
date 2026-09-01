@@ -123,17 +123,40 @@ def test_get_retries_on_connection_error():
     assert client.session.calls == 2
 
 
-def test_get_logs_bunny_shield_js_challenge_on_final_failure(capsys):
-    # A real Bunny Shield challenge page still comes back as HTTP 403, but
-    # tagged with this header - worth calling out explicitly in the run log,
-    # since no amount of retrying a plain HTTP client can solve it.
-    challenge_response = (403, {"CDN-Challenge": "true", "ErrorCode": "112"})
-    client, _ = make_client([challenge_response] * http_client.MAX_ATTEMPTS)
+CHALLENGE_RESPONSE = (403, {"CDN-Challenge": "true", "ErrorCode": "112"})
 
-    with pytest.raises(requests.HTTPError):
+
+def test_get_falls_back_to_solving_the_challenge_and_succeeds(capsys):
+    # A real Bunny Shield challenge page still comes back as HTTP 403, but
+    # tagged with this header. A plain HTTP client can never solve it by
+    # retrying, so get() should fall back to _solve_challenge() instead -
+    # faked out here so the test never touches a real browser - and then
+    # try the request again.
+    client, _ = make_client([CHALLENGE_RESPONSE] * http_client.MAX_ATTEMPTS)
+    solved_with = []
+    client._solve_challenge = solved_with.append
+
+    resp = client.get("https://example.com")
+
+    assert resp.status_code == 200
+    assert solved_with == ["https://example.com"]
+    # MAX_ATTEMPTS calls all hit the challenge, then one more succeeds
+    # once the (faked) challenge-solving has "run".
+    assert client.session.calls == http_client.MAX_ATTEMPTS + 1
+    assert "solving Bunny Shield's JS challenge" in capsys.readouterr().out
+
+
+def test_get_raises_if_challenge_persists_after_solving_attempt():
+    # The challenge-solving fallback only gets one try per get() call - if
+    # the site still challenges every request afterwards (e.g. the
+    # headless browser also got blocked), this must not retry forever.
+    client, _ = make_client([CHALLENGE_RESPONSE] * (http_client.MAX_ATTEMPTS * 2))
+    client._solve_challenge = lambda url: None
+
+    with pytest.raises(http_client.BunnyShieldChallenge):
         client.get("https://example.com")
 
-    assert "Bunny Shield JS challenge" in capsys.readouterr().out
+    assert client.session.calls == http_client.MAX_ATTEMPTS * 2
 
 
 def test_get_does_not_retry_on_404():

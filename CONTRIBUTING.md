@@ -11,6 +11,14 @@
 pip install -r scripts/requirements-dev.txt
 ```
 
+Тестам браузер не потрібен (fallback на Playwright замоканий), а от щоб
+реально запустити скрипти локально (і саме потрапити у сценарій з
+JS-челенджем Bunny Shield) — додатково один раз:
+
+```bash
+playwright install chromium
+```
+
 ## Запуск тестів
 
 ```bash

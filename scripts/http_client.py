@@ -12,10 +12,23 @@ matters a lot for how requests must be made:
   cookie across page loads; independent cookie-less requests look much
   more like a bot.
 * No `Retry-After` header is sent, so backoff timings are our own choice.
+* Traffic from cloud/hosting IP ranges (which is exactly what GitHub-hosted
+  Actions runners are - Azure datacenter addresses) can get a *JavaScript*
+  challenge instead of a plain block: HTTP 403 with a `CDN-Challenge: true`
+  header and a page titled "Establishing a secure connection ...". No
+  amount of retrying, headers or session cookies gets a scripted HTTP
+  client past that - it requires actually running the page's JavaScript,
+  which is what `SiteClient._solve_challenge` uses a headless browser for
+  (see below).
 
 So every request in a run goes through one shared `requests.Session`
 (persisting cookies), with a small delay between requests and retries
-with exponential backoff on the responses the shield produces.
+with exponential backoff on the responses the shield produces. If the
+final retry is specifically the JS challenge, the client falls back to
+solving it once with a headless browser (Playwright/Chromium) and copies
+the resulting cookies into the same session, so every actual page fetch -
+including non-HTML ones like sitemap.xml - still goes through plain,
+fast `requests` calls rather than a full browser.
 """
 
 from __future__ import annotations
@@ -58,6 +71,11 @@ INITIAL_BACKOFF_SECONDS = 2.0
 #: under the burst threshold that triggers the shield.
 MIN_REQUEST_INTERVAL_SECONDS = 1.5
 
+#: How long to give the headless browser to load a page and let Bunny
+#: Shield's challenge script finish running, in milliseconds.
+CHALLENGE_PAGE_LOAD_TIMEOUT_MS = 30_000
+CHALLENGE_SETTLE_TIMEOUT_MS = 8_000
+
 
 def build_headers(user_agent: str) -> dict[str, str]:
     """Return browser-like request headers built around ``user_agent``."""
@@ -70,11 +88,26 @@ def build_headers(user_agent: str) -> dict[str, str]:
     }
 
 
+def is_bunny_shield_challenge(resp: requests.Response) -> bool:
+    """Return True if ``resp`` is Bunny Shield's JS challenge page, not a plain block."""
+    return resp.headers.get("CDN-Challenge") == "true"
+
+
+class BunnyShieldChallenge(requests.HTTPError):
+    """Raised when every retry still gets Bunny Shield's JS challenge page.
+
+    A subclass of ``requests.HTTPError`` so existing callers that only
+    catch that (or plain ``Exception``) keep working unchanged.
+    """
+
+
 class SiteClient:
     """A polite, retrying HTTP client that reuses one session for a whole run.
 
     Create one per run and pass it around; it keeps the shield's cookies,
-    spaces requests out, and retries the failures the shield produces.
+    spaces requests out, retries the failures the shield produces, and
+    falls back to a headless browser if it runs into a JS challenge that
+    plain retries cannot solve.
     """
 
     def __init__(self, user_agent: str | None = None, sleep=time.sleep):
@@ -83,6 +116,7 @@ class SiteClient:
         self.session.headers.update(build_headers(self.user_agent))
         self._sleep = sleep
         self._last_request_at: float | None = None
+        self._challenge_solved = False
 
     def _wait_between_requests(self) -> None:
         """Sleep just enough that consecutive requests stay politely spaced."""
@@ -93,12 +127,13 @@ class SiteClient:
         if remaining > 0:
             self._sleep(remaining)
 
-    def get(self, url: str, timeout: int = 30) -> requests.Response:
+    def _get_with_retries(self, url: str, timeout: int) -> requests.Response:
         """GET ``url``, retrying with exponential backoff on shield/transient errors.
 
-        Raises the final ``requests.HTTPError`` (or connection error) if
-        every attempt fails, so a persistently blocked run fails loudly
-        rather than silently returning nothing to parse.
+        Raises BunnyShieldChallenge if the last attempt is specifically
+        Bunny Shield's JS challenge page (a signal worth reacting to
+        differently from a plain, unsolvable block), or the plain
+        ``requests.HTTPError``/connection error for anything else.
         """
         backoff = INITIAL_BACKOFF_SECONDS
 
@@ -123,15 +158,10 @@ class SiteClient:
                     resp.raise_for_status()
                     return resp
                 if is_last_attempt:
-                    if resp.headers.get("CDN-Challenge") == "true":
-                        # Bunny Shield answered with a JavaScript challenge
-                        # page (not a plain "no browser User-Agent" block) -
-                        # a scripted HTTP client can never solve one, no
-                        # matter how many times it retries. Logged so a
-                        # failed run says *why* instead of just "403".
-                        print(
-                            f"  {url} -> Bunny Shield JS challenge "
-                            f"(ErrorCode={resp.headers.get('ErrorCode')}), not solvable by a plain HTTP client."
+                    if is_bunny_shield_challenge(resp):
+                        raise BunnyShieldChallenge(
+                            f"Bunny Shield JS challenge (ErrorCode={resp.headers.get('ErrorCode')}) for {url}",
+                            response=resp,
                         )
                     resp.raise_for_status()
                     return resp
@@ -142,3 +172,55 @@ class SiteClient:
             backoff *= 2
 
         raise RuntimeError(f"Failed to fetch {url}")
+
+    def _solve_challenge(self, url: str) -> None:
+        """Load ``url`` in a headless browser once to pass Bunny Shield's JS challenge.
+
+        Copies the cookies the browser ends up with into this client's
+        plain ``requests.Session``, so every subsequent ``get()`` call -
+        including for non-HTML URLs like sitemap.xml, which a browser
+        would otherwise wrap in its own XML viewer - goes back to fast,
+        ordinary HTTP requests instead of needing a browser each time.
+
+        A no-op after the first successful call, since one solved
+        challenge's cookies are good for the rest of this run.
+        """
+        if self._challenge_solved:
+            return
+
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            try:
+                context = browser.new_context(user_agent=self.user_agent)
+                page = context.new_page()
+                page.goto(url, wait_until="load", timeout=CHALLENGE_PAGE_LOAD_TIMEOUT_MS)
+                # The challenge page runs a script and redirects to the real
+                # page once it passes; goto() only waits for the challenge
+                # page's own load, so give the redirect a moment to happen.
+                page.wait_for_timeout(CHALLENGE_SETTLE_TIMEOUT_MS)
+                cookies = context.cookies()
+            finally:
+                browser.close()
+
+        for cookie in cookies:
+            self.session.cookies.set(
+                cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie.get("path", "/")
+            )
+        self._challenge_solved = True
+
+    def get(self, url: str, timeout: int = 30) -> requests.Response:
+        """GET ``url``, retrying on shield/transient errors and solving a JS challenge if hit.
+
+        Raises the final ``requests.HTTPError`` (or connection error) if
+        every attempt - including the post-challenge retry - still fails,
+        so a persistently blocked run fails loudly rather than silently
+        returning nothing to parse.
+        """
+        try:
+            return self._get_with_retries(url, timeout)
+        except BunnyShieldChallenge:
+            print(f"  {url} -> solving Bunny Shield's JS challenge with a headless browser...")
+            self._solve_challenge(url)
+        return self._get_with_retries(url, timeout)

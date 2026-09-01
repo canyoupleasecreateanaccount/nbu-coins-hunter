@@ -31,6 +31,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
+      # coins.bank.gov.ua's bot shield answers cloud/datacenter IPs (which
+      # is exactly what this runner has) with a JavaScript challenge that
+      # plain HTTP requests can never solve - http_client.SiteClient falls
+      # back to a real headless browser for that one case. The browser
+      # binary itself is cached (~/.cache/ms-playwright) so a routine run
+      # does not re-download it; only the OS dependencies get reinstalled
+      # every time, since this VM is thrown away after each run.
+      - name: Cache Playwright browser binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('scripts/requirements.txt') }}
+
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
+
       - name: Check for new coin news
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
