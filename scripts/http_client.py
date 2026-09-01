@@ -23,12 +23,16 @@ matters a lot for how requests must be made:
   page's JavaScript, which is what `SiteClient._solve_challenge` uses a
   headless browser for (see below).
 
-So every request in a run goes through one shared `requests.Session`
-(persisting cookies), with a small delay between requests and retries
-with exponential backoff on the responses the shield produces. If every
-retry still gets refused with HTTP 403, the client falls back to:
+`SiteClient.get()` still tries a direct request first - a genuinely
+different IP or a relaxed shield would make that the fast path, and it is
+cheap even when it fails: a 403 is never worth retrying with backoff (see
+`_get_with_retries`), so a blocked direct attempt costs one request, not
+the ~15-30s a full backoff cycle would take. GitHub-hosted runners get
+refused on effectively every attempt in practice (confirmed repeatedly
+across real runs), so in this project's actual usage that one request
+almost always fails and falls through to:
 
-1. Routing the request through a free public proxy instead (see
+1. Routing the request through a free public proxy (see
    `_find_working_proxy`) - most candidates are dead or blocked the same
    way, but trying up to a couple hundred (pooled from several public
    lists, several in flight at once, Russian-hosted ones filtered out)
@@ -36,12 +40,13 @@ retry still gets refused with HTTP 403, the client falls back to:
    entirely. Free proxies are flaky, so an adopted one that later stops
    working mid-run is dropped and replaced from the same pool (see
    `get()`) rather than failing the run outright.
-2. Only if no proxy is left working and the block was specifically the JS
-   challenge (not a plain block, which a browser cannot do anything about
-   either): solving it once with a headless browser (Playwright/Chromium)
-   and copying the resulting cookies into the same session, so every
-   actual page fetch - including non-HTML ones like sitemap.xml - still
-   goes through plain, fast `requests` calls rather than a full browser.
+2. Only if no proxy is left working and the direct block was specifically
+   the JS challenge (not a plain block, which a browser cannot do
+   anything about either): solving it once with a headless browser
+   (Playwright/Chromium) and copying the resulting cookies into the same
+   session, so every actual page fetch - including non-HTML ones like
+   sitemap.xml - still goes through plain, fast `requests` calls rather
+   than a full browser.
 """
 
 from __future__ import annotations
@@ -134,11 +139,12 @@ MAX_PROXY_BATCHES = 3
 
 #: Once routed through an already-adopted proxy, a lower timeout and
 #: attempt count than the direct-request defaults: a genuinely working
-#: proxy responds quickly (it just proved that during selection), and
-#: backing off to retry the *same* dead proxy rarely helps the way it
+#: proxy responds quickly (matches PROXY_TEST_TIMEOUT_SECONDS, since that
+#: is exactly the budget it already proved itself in during selection),
+#: and backing off to retry the *same* dead proxy rarely helps the way it
 #: does for a real rate limit - abandoning it for a different one (see
 #: SiteClient.get) is more productive than waiting it out.
-PROXY_REQUEST_TIMEOUT_SECONDS = 10
+PROXY_REQUEST_TIMEOUT_SECONDS = PROXY_TEST_TIMEOUT_SECONDS
 MAX_PROXY_REQUEST_ATTEMPTS = 2
 
 
@@ -275,12 +281,15 @@ class SiteClient:
             self._sleep(remaining)
 
     def _get_with_retries(self, url: str, timeout: int, max_attempts: int = MAX_ATTEMPTS) -> requests.Response:
-        """GET ``url``, retrying with exponential backoff on shield/transient errors.
+        """GET ``url``, retrying with exponential backoff on rate-limit/server errors.
 
-        Raises BunnyShieldBlocked if the last attempt is still refused with
-        HTTP 403 (a signal worth reacting to with the fallbacks below,
-        rather than failing outright), or the plain
-        ``requests.HTTPError``/connection error for anything else.
+        Raises BunnyShieldBlocked the moment *any* attempt comes back HTTP
+        403 - unlike 429/5xx, backing off and retrying the same 403 has
+        never once helped in testing (it is a standing block or challenge,
+        not a transient condition), so there is no reason to burn the
+        usual backoff cycle on it before reacting with the fallbacks
+        below. Raises the plain ``requests.HTTPError``/connection error
+        for anything else, after exhausting ``max_attempts`` retries.
         """
         backoff = INITIAL_BACKOFF_SECONDS
 
@@ -304,13 +313,13 @@ class SiteClient:
                     # retrying cannot fix - raise_for_status decides which.
                     resp.raise_for_status()
                     return resp
+                if resp.status_code == 403:
+                    is_challenge = is_bunny_shield_challenge(resp)
+                    kind = "JS challenge" if is_challenge else "block"
+                    raise BunnyShieldBlocked(
+                        f"Bunny Shield {kind} for {url}", response=resp, is_js_challenge=is_challenge
+                    )
                 if is_last_attempt:
-                    if resp.status_code == 403:
-                        is_challenge = is_bunny_shield_challenge(resp)
-                        kind = "JS challenge" if is_challenge else "block"
-                        raise BunnyShieldBlocked(
-                            f"Bunny Shield {kind} for {url}", response=resp, is_js_challenge=is_challenge
-                        )
                     resp.raise_for_status()
                     return resp
                 reason = f"HTTP {resp.status_code}"
@@ -426,27 +435,28 @@ class SiteClient:
         self._challenge_solved = True
 
     def get(self, url: str, timeout: int = 30) -> requests.Response:
-        """GET ``url``, retrying on shield/transient errors and falling back if every retry is blocked.
+        """GET ``url``, trying direct first and falling back if Bunny Shield refuses it.
 
-        If this client already adopted a working proxy for an earlier
-        call, that is tried first (a lower timeout/attempt budget than a
-        direct request, since a genuinely working proxy responds quickly,
-        and a dead one is more productive to abandon than to wait out).
-        Free proxies are flaky, so one that worked before can still stop
-        working mid-run - when that happens, it is dropped and a
-        replacement is searched for, same as if there had been no proxy
-        at all.
+        A direct 403 is never worth retrying with backoff (see
+        ``_get_with_retries``), so this costs at most one wasted request
+        before falling back - not the ~15-30s a full backoff cycle would
+        take. If this client already adopted a working proxy for an
+        earlier call, that is tried first instead (a lower timeout/attempt
+        budget than a direct request, since a genuinely working proxy
+        responds quickly, and a dead one is more productive to abandon
+        than to wait out). Free proxies are flaky, so one that worked
+        before can still stop working mid-run - when that happens, it is
+        dropped and a replacement is searched for, same as a fresh block.
 
-        On a persistent HTTP 403 with no (or no more) working proxy
-        available, falls back to a headless browser - but only for a JS
-        challenge specifically, since a browser cannot do anything a
-        proxy-less plain block either.
+        Once every proxy candidate has been tried with no luck, falls back
+        to a headless browser - but only if the direct block was
+        specifically the JS challenge, since a browser cannot do anything
+        about a plain block either.
 
         Raises the final ``requests.HTTPError`` (or connection error) if
         every attempt still fails, so a persistently blocked run fails
         loudly rather than silently returning nothing to parse.
         """
-        is_challenge: bool | None
         if self.session.proxies:
             try:
                 return self._get_with_retries(
@@ -455,29 +465,18 @@ class SiteClient:
             except (BunnyShieldBlocked, requests.RequestException) as exc:
                 print(f"  {url} -> the adopted proxy stopped working ({type(exc).__name__}), looking for another...")
                 self.session.proxies = {}
-            # Unknown here: the failure was proxy-side, not a fresh read of
-            # whether coins.bank.gov.ua itself would even still block us
-            # directly for this URL - resolved below if no proxy is found.
-            is_challenge = None
-        else:
-            try:
-                return self._get_with_retries(url, timeout)
-            except BunnyShieldBlocked as exc:
-                print(f"  {url} -> {exc}, trying a free public proxy...")
-                is_challenge = exc.is_js_challenge
-                last_error = exc
+
+        try:
+            return self._get_with_retries(url, timeout)
+        except BunnyShieldBlocked as exc:
+            print(f"  {url} -> {exc}, trying a free public proxy...")
+            is_challenge = exc.is_js_challenge
+            last_error = exc
 
         for _ in range(MAX_PROXY_BATCHES):
             proxy_resp = self._find_working_proxy(url)
             if proxy_resp is not None:
                 return proxy_resp
-
-        if is_challenge is None:
-            try:
-                return self._get_with_retries(url, timeout)
-            except BunnyShieldBlocked as exc:
-                is_challenge = exc.is_js_challenge
-                last_error = exc
 
         if not is_challenge:
             raise last_error

@@ -84,13 +84,18 @@ def test_get_retries_on_rate_limit_then_succeeds():
     assert slept, "expected a backoff sleep between attempts"
 
 
-def test_get_retries_on_shield_403_then_succeeds():
-    client, slept = make_client([403, 403, 200])
+def test_get_with_retries_raises_immediately_on_403_without_backing_off():
+    # Unlike 429/5xx, a 403 from Bunny Shield has never once turned out to
+    # be transient in testing - backing off and retrying it just wastes
+    # ~15-30s before failing anyway, so it should bail on the very first
+    # attempt instead of working through the usual retry cycle.
+    client, slept = make_client([(403, {}), 200])
 
-    resp = client.get("https://example.com")
+    with pytest.raises(http_client.BunnyShieldBlocked):
+        client._get_with_retries("https://example.com", timeout=30)
 
-    assert resp.status_code == 200
-    assert client.session.calls == 3
+    assert client.session.calls == 1
+    assert slept == []
 
 
 def test_get_gives_up_and_raises_after_max_attempts():
@@ -175,7 +180,7 @@ PLAIN_BLOCK_RESPONSE = (403, {})
 def test_get_falls_back_to_a_proxy_and_succeeds_without_touching_the_browser():
     # A working free proxy sidesteps the block entirely - no need to ever
     # reach for the (much heavier) headless-browser fallback.
-    client, _ = make_client([CHALLENGE_RESPONSE] * http_client.MAX_ATTEMPTS)
+    client, _ = make_client([CHALLENGE_RESPONSE])
     client._find_working_proxy = lambda url: FakeResponse(200)
     client._solve_challenge = lambda url: pytest.fail("should not be called when a proxy already worked")
 
@@ -190,7 +195,7 @@ def test_get_falls_back_to_solving_the_challenge_when_no_proxy_works(capsys):
     # retrying, so once no free proxy works either, get() should fall back
     # to _solve_challenge() - faked out here so the test never touches a
     # real browser - and then try the request again.
-    client, _ = make_client([CHALLENGE_RESPONSE] * http_client.MAX_ATTEMPTS)
+    client, _ = make_client([CHALLENGE_RESPONSE])
     client._find_working_proxy = lambda url: None
     solved_with = []
     client._solve_challenge = solved_with.append
@@ -199,9 +204,9 @@ def test_get_falls_back_to_solving_the_challenge_when_no_proxy_works(capsys):
 
     assert resp.status_code == 200
     assert solved_with == ["https://example.com"]
-    # MAX_ATTEMPTS calls all hit the challenge, then one more succeeds
-    # once the (faked) challenge-solving has "run".
-    assert client.session.calls == http_client.MAX_ATTEMPTS + 1
+    # One call hits the challenge (immediately, no backoff), then one more
+    # succeeds once the (faked) challenge-solving has "run".
+    assert client.session.calls == 2
     assert "solving Bunny Shield's JS challenge" in capsys.readouterr().out
 
 
@@ -209,14 +214,16 @@ def test_get_raises_if_challenge_persists_after_every_fallback():
     # The challenge-solving fallback only gets one try per get() call - if
     # the site still challenges every request afterwards (e.g. the
     # headless browser also got blocked), this must not retry forever.
-    client, _ = make_client([CHALLENGE_RESPONSE] * (http_client.MAX_ATTEMPTS * 2))
+    client, _ = make_client([CHALLENGE_RESPONSE, CHALLENGE_RESPONSE])
     client._find_working_proxy = lambda url: None
     client._solve_challenge = lambda url: None
 
     with pytest.raises(http_client.BunnyShieldBlocked):
         client.get("https://example.com")
 
-    assert client.session.calls == http_client.MAX_ATTEMPTS * 2
+    # One call for the initial direct attempt, one more for the retry
+    # after (faked) challenge-solving - both hit the challenge immediately.
+    assert client.session.calls == 2
 
 
 def test_next_proxy_batch_does_not_hand_out_the_same_candidate_twice(monkeypatch):
@@ -235,7 +242,13 @@ def test_get_finds_a_replacement_when_the_adopted_proxy_stops_working(capsys):
     # same run can still die on a later one. get() must drop it and look
     # for a replacement instead of letting the connection error crash the
     # whole run.
-    client, _ = make_client([requests.ConnectionError("proxy died")] * http_client.MAX_PROXY_REQUEST_ATTEMPTS)
+    # A fresh direct attempt follows the dead proxy (see the "no proxy
+    # left" test below) - scripted to fail here too, so the flow actually
+    # reaches the proxy search this test means to exercise.
+    statuses = [requests.ConnectionError("proxy died")] * http_client.MAX_PROXY_REQUEST_ATTEMPTS + [
+        PLAIN_BLOCK_RESPONSE
+    ]
+    client, _ = make_client(statuses)
     client.session.proxies = {"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"}
     searched_with = []
 
@@ -253,12 +266,13 @@ def test_get_finds_a_replacement_when_the_adopted_proxy_stops_working(capsys):
 
 
 def test_get_falls_back_to_the_browser_after_the_adopted_proxy_dies_with_no_replacement():
-    # Once every proxy has been tried and none works, get() has never
-    # actually re-checked whether coins.bank.gov.ua itself would still
-    # challenge a direct request for this specific URL (it went straight
-    # through the now-dead proxy) - it needs one fresh direct read before
-    # deciding whether a headless browser is even worth trying.
-    statuses = [requests.ConnectionError("proxy died")] + [CHALLENGE_RESPONSE] * (http_client.MAX_ATTEMPTS * 2)
+    # Once the adopted proxy dies and no replacement is found, get() falls
+    # through to a fresh direct attempt - the only way left to know
+    # whether coins.bank.gov.ua would even still challenge this specific
+    # URL directly, which decides whether a headless browser is worth it.
+    statuses = [requests.ConnectionError("proxy died")] * http_client.MAX_PROXY_REQUEST_ATTEMPTS + [
+        CHALLENGE_RESPONSE
+    ]
     client, _ = make_client(statuses)
     client.session.proxies = {"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"}
     client._find_working_proxy = lambda url: None
@@ -275,7 +289,7 @@ def test_get_does_not_try_the_browser_for_a_plain_block_with_no_challenge():
     # A plain 403 with no CDN-Challenge header is not a JS challenge - a
     # headless browser cannot do anything a plain request could not, so
     # it should never even be attempted; only the proxy fallback can help.
-    client, _ = make_client([PLAIN_BLOCK_RESPONSE] * http_client.MAX_ATTEMPTS)
+    client, _ = make_client([PLAIN_BLOCK_RESPONSE])
     client._find_working_proxy = lambda url: None
     client._solve_challenge = lambda url: pytest.fail("should not be called for a plain block")
 
