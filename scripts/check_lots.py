@@ -115,10 +115,18 @@ def fetch_products(client: SiteClient, start_url: str = BASE_URL) -> dict[str, d
 
 
 def load_state(path: Path = STATE_FILE) -> dict:
-    """Load the previous run's catalog snapshot, or an empty one if it does not exist."""
+    """Load the previous run's catalog snapshot, or an empty one if it does not exist.
+
+    The returned dict's ``baselined`` key - not just file existence - is
+    what main() uses to decide whether this is the first real run: the
+    state file itself ships committed to the repo (like the other two
+    scripts' state files), pre-seeded with an empty snapshot and no
+    ``baselined`` key, so checking mere file existence would never detect
+    a first run at all, for this repo or any fork of it.
+    """
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
-    return {"available_ids": []}
+    return {"available_ids": [], "baselined": False}
 
 
 def save_state(state: dict, path: Path = STATE_FILE) -> None:
@@ -138,13 +146,14 @@ def main() -> None:
     client = SiteClient()
     products = fetch_products(client)
 
-    # Unlike check_news.py/check_sitemap.py, an empty result here is a
-    # legitimate steady state (nothing currently for sale), not a sign the
-    # page failed to parse - so "first run" is decided by whether the state
-    # file exists yet, not by whether the last snapshot was empty.
-    is_first_run = not STATE_FILE.exists()
+    # Unlike check_news.py/check_sitemap.py, an empty snapshot here is a
+    # legitimate steady state (nothing currently for sale), not just the
+    # first run's starting point - so "first run" is tracked with its own
+    # explicit flag instead of reusing "no IDs seen yet".
     state = load_state()
+    is_first_run = not state.get("baselined", False)
     previous_ids = set(state.get("available_ids", []))
+    state["baselined"] = True
 
     if is_first_run:
         print(f"First run: baselining {len(products)} catalog item(s) without notifying.")

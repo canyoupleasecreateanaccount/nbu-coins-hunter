@@ -80,10 +80,23 @@ def test_save_and_load_state_round_trip(tmp_path):
     assert loaded == state
 
 
-def test_load_state_returns_empty_state_when_file_missing(tmp_path):
+def test_load_state_returns_empty_unbaselined_state_when_file_missing(tmp_path):
     state_path = tmp_path / "does_not_exist.json"
 
-    assert check_lots.load_state(path=state_path) == {"available_ids": []}
+    assert check_lots.load_state(path=state_path) == {"available_ids": [], "baselined": False}
+
+
+def test_load_state_treats_a_committed_placeholder_as_not_yet_baselined(tmp_path):
+    # The state file ships committed to the repo (like the other two
+    # scripts' state files) pre-seeded with an empty snapshot and no
+    # "baselined" key - this must still read as "first run", the same as
+    # a genuinely missing file, or a first real run on a fresh fork would
+    # never baseline silently and would instead notify about every
+    # already-on-sale item as if it were brand new.
+    state_path = tmp_path / "seen_lots.json"
+    state_path.write_text('{"available_ids": []}', encoding="utf-8")
+
+    assert check_lots.load_state(path=state_path).get("baselined", False) is False
 
 
 def test_fetch_products_follows_pagination_until_exhausted(monkeypatch):
