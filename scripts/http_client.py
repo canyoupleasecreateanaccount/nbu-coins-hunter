@@ -123,6 +123,16 @@ class SiteClient:
                     resp.raise_for_status()
                     return resp
                 if is_last_attempt:
+                    if resp.headers.get("CDN-Challenge") == "true":
+                        # Bunny Shield answered with a JavaScript challenge
+                        # page (not a plain "no browser User-Agent" block) -
+                        # a scripted HTTP client can never solve one, no
+                        # matter how many times it retries. Logged so a
+                        # failed run says *why* instead of just "403".
+                        print(
+                            f"  {url} -> Bunny Shield JS challenge "
+                            f"(ErrorCode={resp.headers.get('ErrorCode')}), not solvable by a plain HTTP client."
+                        )
                     resp.raise_for_status()
                     return resp
                 reason = f"HTTP {resp.status_code}"

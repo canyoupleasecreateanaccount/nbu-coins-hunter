@@ -13,9 +13,10 @@ import http_client
 
 
 class FakeResponse:
-    def __init__(self, status_code):
+    def __init__(self, status_code, headers=None):
         self.status_code = status_code
         self.text = "<html></html>"
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -35,6 +36,9 @@ class FakeSession:
         status = self.statuses.pop(0) if self.statuses else 200
         if isinstance(status, Exception):
             raise status
+        if isinstance(status, tuple):
+            status_code, headers = status
+            return FakeResponse(status_code, headers=headers)
         return FakeResponse(status)
 
 
@@ -117,6 +121,19 @@ def test_get_retries_on_connection_error():
 
     assert resp.status_code == 200
     assert client.session.calls == 2
+
+
+def test_get_logs_bunny_shield_js_challenge_on_final_failure(capsys):
+    # A real Bunny Shield challenge page still comes back as HTTP 403, but
+    # tagged with this header - worth calling out explicitly in the run log,
+    # since no amount of retrying a plain HTTP client can solve it.
+    challenge_response = (403, {"CDN-Challenge": "true", "ErrorCode": "112"})
+    client, _ = make_client([challenge_response] * http_client.MAX_ATTEMPTS)
+
+    with pytest.raises(requests.HTTPError):
+        client.get("https://example.com")
+
+    assert "Bunny Shield JS challenge" in capsys.readouterr().out
 
 
 def test_get_does_not_retry_on_404():
