@@ -271,6 +271,18 @@ class SiteClient:
         self._proxy_pool: list[str] | None = None
         self._tried_proxies: set[str] = set()
 
+    def _use_proxy(self, proxies: dict[str, str]) -> None:
+        """Switch this session to ``proxies`` (or {} for none), clearing cookies.
+
+        A proxy change means a different apparent IP - carrying over
+        cookies issued to the *previous* IP (e.g. a Bunny Shield
+        `bunny_shield_id_*` cookie) would be a cookie/IP mismatch, which
+        is itself a common bot-detection signal. Starting cookie-less on
+        every switch avoids handing the shield another reason to block us.
+        """
+        self.session.proxies = proxies
+        self.session.cookies.clear()
+
     def _wait_between_requests(self) -> None:
         """Sleep just enough that consecutive requests stay politely spaced."""
         if self._last_request_at is None:
@@ -394,7 +406,7 @@ class SiteClient:
             return None
         proxy_url, resp = found
         print(f"  {url} -> found a working free proxy ({proxy_url})")
-        self.session.proxies = {"http": proxy_url, "https": proxy_url}
+        self._use_proxy({"http": proxy_url, "https": proxy_url})
         return resp
 
     def _solve_challenge(self, url: str) -> None:
@@ -464,7 +476,7 @@ class SiteClient:
                 )
             except (BunnyShieldBlocked, requests.RequestException) as exc:
                 print(f"  {url} -> the adopted proxy stopped working ({type(exc).__name__}), looking for another...")
-                self.session.proxies = {}
+                self._use_proxy({})
 
         try:
             return self._get_with_retries(url, timeout)

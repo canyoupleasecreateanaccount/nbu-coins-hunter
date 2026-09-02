@@ -23,6 +23,16 @@ class FakeResponse:
             raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
 
+class FakeCookieJar:
+    """Stands in for a requests.Session's cookies, tracking whether it was cleared."""
+
+    def __init__(self):
+        self.clear_calls = 0
+
+    def clear(self):
+        self.clear_calls += 1
+
+
 class FakeSession:
     """Stands in for requests.Session, returning a scripted sequence of responses."""
 
@@ -31,6 +41,7 @@ class FakeSession:
         self.calls = 0
         self.headers = {}
         self.proxies = {}
+        self.cookies = FakeCookieJar()
 
     def get(self, url, timeout=None):
         self.calls += 1
@@ -235,6 +246,30 @@ def test_next_proxy_batch_does_not_hand_out_the_same_candidate_twice(monkeypatch
 
     assert set(first_batch) == {"1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"}
     assert second_batch == []
+
+
+def test_use_proxy_sets_proxies_and_clears_cookies():
+    # A proxy change means a different apparent IP - carrying over cookies
+    # issued to the previous IP (e.g. a Bunny Shield bunny_shield_id_*)
+    # would be a cookie/IP mismatch, itself a common bot-detection signal.
+    client = http_client.SiteClient(user_agent="test-agent", sleep=lambda _: None)
+    client.session = FakeSession([])
+
+    client._use_proxy({"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"})
+
+    assert client.session.proxies == {"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"}
+    assert client.session.cookies.clear_calls == 1
+
+
+def test_use_proxy_clears_cookies_when_dropping_back_to_no_proxy_too():
+    client = http_client.SiteClient(user_agent="test-agent", sleep=lambda _: None)
+    client.session = FakeSession([])
+    client.session.proxies = {"http": "http://1.2.3.4:8080", "https": "http://1.2.3.4:8080"}
+
+    client._use_proxy({})
+
+    assert client.session.proxies == {}
+    assert client.session.cookies.clear_calls == 1
 
 
 def test_get_finds_a_replacement_when_the_adopted_proxy_stops_working(capsys):
