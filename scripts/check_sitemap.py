@@ -10,7 +10,7 @@ itself to read its real title, and - if that title matches the same keyword
 filter used by check_news.py - sends a distinct "spotted in the sitemap,
 not on the site yet" Telegram notification.
 
-Like check_news.py, it is meant to be run repeatedly (e.g. every 15 minutes
+Like check_news.py, it is meant to be run repeatedly (e.g. every 2 hours
 from a GitHub Actions workflow) rather than kept running as a long-lived
 process. It keeps its own state file so it works independently of
 check_news.py's run history.

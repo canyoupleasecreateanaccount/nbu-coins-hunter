@@ -5,7 +5,7 @@ articles it finds against a small JSON state file of previously seen article
 IDs, and sends a Telegram message for every new article whose title matches a
 configurable keyword filter (coin-related news, by default).
 
-It is designed to be run repeatedly (e.g. every 15 minutes from a GitHub
+It is designed to be run repeatedly (e.g. every 2 hours from a GitHub
 Actions workflow) rather than kept running as a long-lived process.
 """
 

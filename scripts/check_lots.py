@@ -25,7 +25,7 @@ and later reappears (restocked) is treated as new again - which is exactly
 what should happen, since a restock is another real chance to buy it.
 
 Like check_news.py and check_sitemap.py, it is designed to be run
-repeatedly (e.g. every 15 minutes from a GitHub Actions workflow) rather
+repeatedly (e.g. every 2 hours from a GitHub Actions workflow) rather
 than kept running as a long-lived process.
 """
 
