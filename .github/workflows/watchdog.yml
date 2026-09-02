@@ -19,9 +19,19 @@ permissions:
 
 env:
   MONITORED_WORKFLOW: check-coin-news.yml
-  # 6x the monitored workflow's 15-minute interval, to absorb the
-  # occasional scheduling delay GitHub documents for cron-triggered runs.
-  STALE_THRESHOLD_MINUTES: 90
+  # 3x the monitored workflow's 2-hour interval, to absorb the occasional
+  # scheduling delay GitHub documents for cron-triggered runs while still
+  # catching a genuinely dead schedule well before a full day goes by.
+  STALE_THRESHOLD_MINUTES: 360
+  # How many scheduled (not manual) runs to expect in a 24h window at the
+  # monitored workflow's 2-hour cadence, and the floor that is worth
+  # alerting on. Deliberately well below EXPECTED: GitHub's scheduler can
+  # skip individual slots under load, and this check exists to catch
+  # chronic under-firing (e.g. 2-3 runs/day instead of 12), not to flag
+  # every missed slot - a single stale run is already caught by
+  # STALE_THRESHOLD_MINUTES above.
+  EXPECTED_SCHEDULED_RUNS_PER_DAY: 12
+  MIN_SCHEDULED_RUNS_PER_DAY: 4
   # Alert when this many most-recent completed runs failed back to back.
   # A single failure is often a transient network blip that the next run
   # recovers from on its own, so alerting on one would just be noise.
@@ -42,9 +52,23 @@ jobs:
           workflow_info=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}")
           state=$(echo "$workflow_info" | jq -r '.state')
 
-          # Fetch several recent runs, not just one: the freshness check only
-          # needs the latest, but spotting "it runs every 15 minutes and fails
-          # every single time" needs a few in a row.
+          # Scheduled-only runs, counted two ways: how many landed in the
+          # last 24h (catches chronic under-firing - e.g. GitHub silently
+          # skipping most slots - that a single fresh run would hide), and
+          # how long it has been since the last one (catches a schedule
+          # that has stopped dead, faster than waiting for the daily count
+          # to drop). A burst of manual workflow_dispatch runs (e.g. while
+          # debugging) must not be able to mask either - hence event=schedule.
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          scheduled_24h=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f "created=>${since}" -f per_page=1)
+          scheduled_count_24h=$(echo "$scheduled_24h" | jq -r '.total_count')
+
+          last_scheduled=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f per_page=1)
+          last_scheduled_at=$(echo "$last_scheduled" | jq -r '.workflow_runs[0].created_at // empty')
+
+          # Any-trigger runs, for the failure-streak check below - a broken
+          # script is broken regardless of what triggered it, and this also
+          # covers "has it ever run at all" for a brand new workflow.
           runs=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs?per_page=${CONSECUTIVE_FAILURES_TO_ALERT}")
           run_count=$(echo "$runs" | jq -r '.total_count')
 
@@ -54,7 +78,6 @@ jobs:
             exit 0
           fi
 
-          last_created_at=$(echo "$runs" | jq -r '.workflow_runs[0].created_at')
           last_conclusion=$(echo "$runs" | jq -r '.workflow_runs[0].conclusion // "in_progress"')
 
           # Count how many of the most recent *completed* runs failed in a row.
@@ -65,25 +88,32 @@ jobs:
           ')
           completed_count=$(echo "$runs" | jq -r '[.workflow_runs[] | select(.conclusion != null)] | length')
 
-          last_epoch=$(date -d "$last_created_at" +%s)
-          now_epoch=$(date -u +%s)
-          minutes_since=$(( (now_epoch - last_epoch) / 60 ))
+          minutes_since_scheduled="n/a"
+          if [ -n "$last_scheduled_at" ]; then
+            last_epoch=$(date -d "$last_scheduled_at" +%s)
+            now_epoch=$(date -u +%s)
+            minutes_since_scheduled=$(( (now_epoch - last_epoch) / 60 ))
+          fi
 
-          echo "State: $state, last run: $last_created_at (${minutes_since} min ago, conclusion: $last_conclusion)"
-          echo "Consecutive failures among ${completed_count} completed runs: ${failed_streak}"
+          echo "State: $state. Scheduled runs in last 24h: ${scheduled_count_24h} (expected ~${EXPECTED_SCHEDULED_RUNS_PER_DAY})."
+          echo "Last scheduled run: ${last_scheduled_at:-never} (${minutes_since_scheduled} min ago)."
+          echo "Consecutive failures among ${completed_count} recent completed runs (any trigger): ${failed_streak}"
 
           if [ "$state" != "active" ]; then
             echo "alert=true" >> "$GITHUB_OUTPUT"
             echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' is not active (state: ${state}). GitHub may have auto-disabled it after 60 days without repository activity - re-enable it from the Actions tab." >> "$GITHUB_OUTPUT"
-          elif [ "$minutes_since" -gt "$STALE_THRESHOLD_MINUTES" ]; then
+          elif [ "$minutes_since_scheduled" != "n/a" ] && [ "$minutes_since_scheduled" -gt "$STALE_THRESHOLD_MINUTES" ]; then
             echo "alert=true" >> "$GITHUB_OUTPUT"
-            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't run in ${minutes_since} minutes (expected every 15). Last conclusion: ${last_conclusion}." >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't had a *scheduled* run in ${minutes_since_scheduled} minutes (expected every 2h). Last conclusion: ${last_conclusion}. If this persists, try disabling and re-enabling the workflow from the Actions tab - GitHub's scheduler can get stuck." >> "$GITHUB_OUTPUT"
+          elif [ "$scheduled_count_24h" -lt "$MIN_SCHEDULED_RUNS_PER_DAY" ]; then
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' only had ${scheduled_count_24h} scheduled run(s) in the last 24h (expected ~${EXPECTED_SCHEDULED_RUNS_PER_DAY}, every 2h). GitHub's scheduler appears to be silently skipping most slots." >> "$GITHUB_OUTPUT"
           elif [ "$completed_count" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ] && [ "$failed_streak" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ]; then
-            # The workflow is running on schedule but every recent run failed.
-            # Its own failure notification may be exactly what is broken (bad
-            # bot token, revoked chat), so this alert is the only safety net.
+            # The workflow is running but every recent run failed. Its own
+            # failure notification may be exactly what is broken (bad bot
+            # token, revoked chat), so this alert is the only safety net.
             echo "alert=true" >> "$GITHUB_OUTPUT"
-            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' is running on schedule but its last ${failed_streak} runs all failed. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/${MONITORED_WORKFLOW}" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' is running but its last ${failed_streak} runs all failed. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/${MONITORED_WORKFLOW}" >> "$GITHUB_OUTPUT"
           else
             echo "alert=false" >> "$GITHUB_OUTPUT"
           fi
