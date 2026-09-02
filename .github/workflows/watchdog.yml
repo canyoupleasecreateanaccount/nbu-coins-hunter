@@ -24,14 +24,12 @@ env:
   # catching a genuinely dead schedule well before a full day goes by.
   STALE_THRESHOLD_MINUTES: 360
   # How many scheduled (not manual) runs to expect in a 24h window at the
-  # monitored workflow's 2-hour cadence, and the floor that is worth
-  # alerting on. Deliberately well below EXPECTED: GitHub's scheduler can
-  # skip individual slots under load, and this check exists to catch
-  # chronic under-firing (e.g. 2-3 runs/day instead of 12), not to flag
-  # every missed slot - a single stale run is already caught by
-  # STALE_THRESHOLD_MINUTES above.
+  # monitored workflow's 2-hour cadence - shown in the alert message for
+  # context. The alert itself only fires on zero: GitHub's scheduler can
+  # legitimately skip individual slots under load, and a single stale run
+  # is already caught by STALE_THRESHOLD_MINUTES above, so this check
+  # exists purely to catch "the schedule did not fire even once all day".
   EXPECTED_SCHEDULED_RUNS_PER_DAY: 12
-  MIN_SCHEDULED_RUNS_PER_DAY: 4
   # Alert when this many most-recent completed runs failed back to back.
   # A single failure is often a transient network blip that the next run
   # recovers from on its own, so alerting on one would just be noise.
@@ -105,9 +103,9 @@ jobs:
           elif [ "$minutes_since_scheduled" != "n/a" ] && [ "$minutes_since_scheduled" -gt "$STALE_THRESHOLD_MINUTES" ]; then
             echo "alert=true" >> "$GITHUB_OUTPUT"
             echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't had a *scheduled* run in ${minutes_since_scheduled} minutes (expected every 2h). Last conclusion: ${last_conclusion}. If this persists, try disabling and re-enabling the workflow from the Actions tab - GitHub's scheduler can get stuck." >> "$GITHUB_OUTPUT"
-          elif [ "$scheduled_count_24h" -lt "$MIN_SCHEDULED_RUNS_PER_DAY" ]; then
+          elif [ "$scheduled_count_24h" -eq 0 ]; then
             echo "alert=true" >> "$GITHUB_OUTPUT"
-            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' only had ${scheduled_count_24h} scheduled run(s) in the last 24h (expected ~${EXPECTED_SCHEDULED_RUNS_PER_DAY}, every 2h). GitHub's scheduler appears to be silently skipping most slots." >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' had zero scheduled runs in the last 24h (expected ~${EXPECTED_SCHEDULED_RUNS_PER_DAY}, every 2h). GitHub's scheduler appears to have stopped firing it entirely." >> "$GITHUB_OUTPUT"
           elif [ "$completed_count" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ] && [ "$failed_streak" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ]; then
             # The workflow is running but every recent run failed. Its own
             # failure notification may be exactly what is broken (bad bot
