@@ -58,10 +58,10 @@ jobs:
           # to drop). A burst of manual workflow_dispatch runs (e.g. while
           # debugging) must not be able to mask either - hence event=schedule.
           since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-          scheduled_24h=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f "created=>${since}" -f per_page=1)
+          scheduled_24h=$(gh api -X GET "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f "created=>${since}" -f per_page=1)
           scheduled_count_24h=$(echo "$scheduled_24h" | jq -r '.total_count')
 
-          last_scheduled=$(gh api "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f per_page=1)
+          last_scheduled=$(gh api -X GET "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f per_page=1)
           last_scheduled_at=$(echo "$last_scheduled" | jq -r '.workflow_runs[0].created_at // empty')
 
           # Any-trigger runs, for the failure-streak check below - a broken
@@ -133,4 +133,26 @@ jobs:
             curl -sS -X POST "https://api.telegram.org/bot${token}/sendMessage" \
               --data-urlencode "chat_id=${chat_id}" \
               --data-urlencode "text=${ALERT_MESSAGE}"
+          done
+
+      # The watchdog is the last line of defence, so its own breakage must
+      # not be silent - without this, a bad API call here just goes red on
+      # the Actions tab while everyone assumes "no alert" means "all fine".
+      - name: Notify on watchdog failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_RECIPIENTS: ${{ secrets.TELEGRAM_RECIPIENTS }}
+        run: |
+          message="⚠️ Watchdog itself failed (run #${{ github.run_number }}) - the coin-news checker is currently unmonitored. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          recipients="${TELEGRAM_RECIPIENTS:-${TELEGRAM_BOT_TOKEN}:${TELEGRAM_CHAT_ID}}"
+          echo "$recipients" | tr ',' '\n' | while IFS= read -r entry; do
+            entry="$(echo "$entry" | tr -d '[:space:]')"
+            [ -z "$entry" ] && continue
+            token="${entry%:*}"
+            chat_id="${entry##*:}"
+            curl -sS -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+              --data-urlencode "chat_id=${chat_id}" \
+              --data-urlencode "text=${message}"
           done
