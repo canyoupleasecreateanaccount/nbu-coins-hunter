@@ -9,9 +9,12 @@ name: Watchdog for coin news checker
 
 on:
   schedule:
-    # Offset off :00 for the same reason as check-coin-news.yml's schedule:
-    # round minutes are GitHub's busiest scheduling slots.
-    - cron: '11 */3 * * *'
+    # Roughly every 16 hours. Cron has no way to express a period that does
+    # not divide 24, so this lands at 00:11 and 16:11 UTC - a 16h gap then
+    # an 8h one, rather than two even 16h gaps. Offset off :00 for the same
+    # reason as check-coin-news.yml's schedule: round minutes are GitHub's
+    # busiest scheduling slots.
+    - cron: '11 */16 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -20,8 +23,10 @@ permissions:
 env:
   MONITORED_WORKFLOW: check-coin-news.yml
   # 3x the monitored workflow's 2-hour interval, to absorb the occasional
-  # scheduling delay GitHub documents for cron-triggered runs while still
-  # catching a genuinely dead schedule well before a full day goes by.
+  # scheduling delay GitHub documents for cron-triggered runs. Note this is
+  # the age at which a missing run counts as a problem, not how quickly we
+  # notice: the watchdog only looks every 16 hours, so that is the real
+  # upper bound on how long a dead schedule can go unreported.
   STALE_THRESHOLD_MINUTES: 360
   # How many scheduled (not manual) runs to expect in a 24h window at the
   # monitored workflow's 2-hour cadence - shown in the alert message for
