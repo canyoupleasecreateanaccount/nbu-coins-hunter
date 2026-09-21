@@ -30,7 +30,10 @@ cheap even when it fails: a 403 is never worth retrying with backoff (see
 the ~15-30s a full backoff cycle would take. GitHub-hosted runners get
 refused on effectively every attempt in practice (confirmed repeatedly
 across real runs), so in this project's actual usage that one request
-almost always fails and falls through to:
+almost always fails and falls through to the fallbacks below. So does a
+connection the edge refuses at the TCP level (Errno 111) once its retries
+run out - that happened once and took down all three checks in that run.
+The fallbacks, in order:
 
 1. Routing the request through a free public proxy (see
    `_find_working_proxy`) - most candidates are dead or blocked the same
@@ -452,7 +455,10 @@ class SiteClient:
         A direct 403 is never worth retrying with backoff (see
         ``_get_with_retries``), so this costs at most one wasted request
         before falling back - not the ~15-30s a full backoff cycle would
-        take. If this client already adopted a working proxy for an
+        take. A connection refused outright (no HTTP answer at all - seen
+        once on a real runner) gets the same fallback, but only after its
+        ordinary retries run out, since a reset can be a passing blip.
+        If this client already adopted a working proxy for an
         earlier call, that is tried first instead (a lower timeout/attempt
         budget than a direct request, since a genuinely working proxy
         responds quickly, and a dead one is more productive to abandon
@@ -483,6 +489,15 @@ class SiteClient:
         except BunnyShieldBlocked as exc:
             print(f"  {url} -> {exc}, trying a free public proxy...")
             is_challenge = exc.is_js_challenge
+            last_error: requests.RequestException = exc
+        except requests.ConnectionError as exc:
+            # The direct retries are already used up. The edge refusing the
+            # connection outright (rather than answering 403) is the same
+            # IP-level block in a different shape, and a different IP is
+            # what gets around it - but it is no JS challenge, so a browser
+            # would be no help.
+            print(f"  {url} -> {type(exc).__name__} on every direct attempt, trying a free public proxy...")
+            is_challenge = False
             last_error = exc
 
         for _ in range(MAX_PROXY_BATCHES):

@@ -228,6 +228,19 @@ for) the shop's own email newsletter for people who prefer Telegram or
 whose emails don't reliably arrive. Setup instructions are in
 [SETUP.md](SETUP.md) (in Ukrainian).
 
+## ☕ Support / Donations
+
+Якщо цей проєкт був для вас корисним, ви можете підтримати його розвиток:
+
+| Мережа / Валюта | Адреса для донату |
+| :--- | :--- |
+| **Bitcoin (BTC)** | `bc1qdmesklh36r03vgw7m6zcxjhakvsxe4q45nk0p4` |
+| **Ethereum (ETH)** | `0x3EC81929e06950322d5125d8e6CA834F3d9B21f8` |
+| **BNB Chain (BNB)** | `0x3EC81929e06950322d5125d8e6CA834F3d9B21f8` |
+| **Polygon (MATIC)** | `0x3EC81929e06950322d5125d8e6CA834F3d9B21f8` |
+| **Solana (SOL)** | `86VzJkNe69YZvnKXrUGwoMVJtPp5yk67eQJokBJph4XW` |
+| **Tron (TRX)** | `TEak8XxSGDeeSY11Dj6BDpiPWadVm75E2C` |
+
 ---
 
 <sub>Ключові слова: монети НБУ, пам'ятні монети України, інвестиційні

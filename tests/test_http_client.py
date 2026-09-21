@@ -334,6 +334,47 @@ def test_get_does_not_try_the_browser_for_a_plain_block_with_no_challenge():
     assert exc_info.value.is_js_challenge is False
 
 
+def test_get_falls_back_to_a_proxy_when_the_direct_connection_is_refused():
+    # Seen on a real runner: the site's edge refused the connection at the
+    # TCP level (Errno 111) instead of answering 403, so the block was never
+    # recognised as one and the proxy fallback was skipped entirely. A
+    # different IP is exactly what gets around that, so once the direct
+    # retries are used up, get() must go looking for a working proxy.
+    client, _ = make_client([requests.ConnectionError("refused")] * http_client.MAX_ATTEMPTS)
+    searched_with = []
+
+    def fake_find(url):
+        searched_with.append(url)
+        return FakeResponse(200)
+
+    client._find_working_proxy = fake_find
+
+    resp = client.get("https://example.com")
+
+    assert resp.status_code == 200
+    assert client.session.calls == http_client.MAX_ATTEMPTS
+    assert searched_with == ["https://example.com"]
+
+
+def test_get_raises_the_connection_error_once_every_proxy_batch_is_exhausted():
+    # A refused connection is not a JS challenge, so the headless browser
+    # cannot help - and the run must still fail loudly, not return nothing.
+    client, _ = make_client([requests.ConnectionError("refused")] * http_client.MAX_ATTEMPTS)
+    batches_tried = []
+
+    def fake_find(url):
+        batches_tried.append(url)
+        return None
+
+    client._find_working_proxy = fake_find
+    client._solve_challenge = lambda url: pytest.fail("should not be called for a refused connection")
+
+    with pytest.raises(requests.ConnectionError):
+        client.get("https://example.com")
+
+    assert len(batches_tried) == http_client.MAX_PROXY_BATCHES
+
+
 def test_get_does_not_retry_on_404():
     # A genuine "not found" is not transient - retrying it just wastes requests.
     client, _ = make_client([404])
