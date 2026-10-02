@@ -62,7 +62,7 @@ def get_recipients() -> list[tuple[str, str]]:
             token, _, chat_id = entry.rpartition(":")
             token, chat_id = token.strip(), chat_id.strip()
             if not token or not chat_id:
-                raise ValueError(f"Invalid TELEGRAM_RECIPIENTS entry (expected 'bot_token:chat_id'): {entry!r}")
+                raise ValueError("Invalid TELEGRAM_RECIPIENTS entry (expected 'bot_token:chat_id')")
             recipients.append((token, chat_id))
         if not recipients:
             raise ValueError("TELEGRAM_RECIPIENTS is set but contains no valid entries")
@@ -116,7 +116,7 @@ def _send_to_recipient(token: str, chat_id: str, text: str, sleep=time.sleep) ->
         )
         if resp.status_code == 429 and attempt < MAX_SEND_ATTEMPTS:
             wait = _retry_after_seconds(resp)
-            print(f"  Telegram rate-limited chat_id={chat_id}, waiting {wait:.1f}s")
+            print(f"  Telegram rate-limited, waiting {wait:.1f}s")
             sleep(wait)
             continue
         resp.raise_for_status()
@@ -137,6 +137,15 @@ def send_telegram(text: str, sleep=time.sleep) -> None:
         try:
             _send_to_recipient(token, chat_id, text, sleep=sleep)
         except requests.RequestException as exc:
-            errors.append(f"chat_id={chat_id}: {exc}")
+            if isinstance(exc, requests.Timeout):
+                reason = "timeout"
+            elif isinstance(exc, requests.ConnectionError):
+                reason = "connection error"
+            elif isinstance(exc, requests.HTTPError):
+                status = exc.response.status_code if exc.response is not None else None
+                reason = f"HTTP {status}" if isinstance(status, int) else "HTTP error"
+            else:
+                reason = "request error"
+            errors.append(reason)
     if errors:
-        raise RuntimeError("Failed to deliver Telegram message to: " + "; ".join(errors))
+        raise RuntimeError("Failed to deliver Telegram message: " + "; ".join(errors)) from None
