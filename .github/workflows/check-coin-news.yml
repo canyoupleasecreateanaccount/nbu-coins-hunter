@@ -120,12 +120,17 @@ jobs:
         run: |
           message="⚠️ Workflow 'Check NBU coin news' failed (run #${{ github.run_number }}). Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           recipients="${TELEGRAM_RECIPIENTS:-${TELEGRAM_BOT_TOKEN}:${TELEGRAM_CHAT_ID}}"
-          echo "$recipients" | tr ',' '\n' | while IFS= read -r entry; do
+          delivery_failed=0
+          while IFS= read -r entry; do
             entry="$(echo "$entry" | tr -d '[:space:]')"
             [ -z "$entry" ] && continue
             token="${entry%:*}"
             chat_id="${entry##*:}"
-            curl -sS -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+            if ! curl -sS --fail --connect-timeout 10 --max-time 30 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
               --data-urlencode "chat_id=${chat_id}" \
-              --data-urlencode "text=${message}"
-          done
+              --data-urlencode "text=${message}" >/dev/null 2>&1; then
+              echo "Telegram notification delivery failed." >&2
+              delivery_failed=1
+            fi
+          done < <(printf '%s\n' "$recipients" | tr ',' '\n')
+          exit "$delivery_failed"
