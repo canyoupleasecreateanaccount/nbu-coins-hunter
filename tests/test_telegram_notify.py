@@ -155,3 +155,48 @@ def test_send_telegram_tries_every_recipient_even_if_one_fails(monkeypatch):
 
     # Both recipients were attempted despite the first one failing.
     assert attempted == ["111", "222"]
+
+
+@pytest.mark.parametrize("outcome", [200, 401, 429, 503, "timeout", "connection"])
+def test_delivery_outcomes_are_safe_and_continue(monkeypatch, capsys, outcome):
+    import traceback
+
+    token, chat_id = "123:synthetic-private-token", "-987654321"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    monkeypatch.setenv("TELEGRAM_RECIPIENTS", f"{token}:{chat_id},other-token:second-chat")
+    attempts, waits = [], []
+
+    def post(request_url, data, timeout):
+        attempts.append(data["chat_id"])
+        assert timeout == 30
+        if data["chat_id"] == chat_id and isinstance(outcome, str):
+            error = requests.Timeout if outcome == "timeout" else requests.ConnectionError
+            raise error(f"{url} chat_id={chat_id}")
+        response = requests.Response()
+        response.status_code = outcome if data["chat_id"] == chat_id else 200
+        response.url = request_url
+        response._content = b'{"parameters": {"retry_after": 0}}'
+        return response
+
+    monkeypatch.setattr(telegram_notify.requests, "post", post)
+    diagnostic = ""
+    if outcome == 200:
+        telegram_notify.send_telegram("hello", sleep=waits.append)
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            telegram_notify.send_telegram("hello", sleep=waits.append)
+        diagnostic = "".join(traceback.format_exception(caught.value))
+        assert ("timeout" if outcome == "timeout" else "connection" if outcome == "connection" else f"HTTP {outcome}") in diagnostic
+    output = capsys.readouterr()
+    diagnostic += output.out + output.err
+    for private in (token, chat_id, url, "api.telegram.org", "other-token", "second-chat"):
+        assert private not in diagnostic
+    assert attempts == [chat_id] * (3 if outcome == 429 else 1) + ["second-chat"]
+    assert waits == ([0.0, 0.0] if outcome == 429 else [])
+
+
+def test_invalid_recipient_diagnostic_does_not_echo_input(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_RECIPIENTS", "synthetic-private-token")
+    with pytest.raises(ValueError) as caught:
+        telegram_notify.get_recipients()
+    assert "synthetic-private-token" not in str(caught.value)
