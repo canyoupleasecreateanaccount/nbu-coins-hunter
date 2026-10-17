@@ -1,11 +1,14 @@
 name: Watchdog for coin news checker
 
-# Runs independently of "Check NBU coin news" and reports when that workflow
+# Runs separately from "Check NBU coin news" and reports when that workflow
 # has stopped actually running - either because a run failed silently before
 # reaching its own failure-notification step, or because GitHub disabled the
 # schedule (e.g. after 60 days without repository activity, or a manual
 # disable). A plain "if: failure()" step inside the monitored workflow can't
 # catch that second case, since a disabled workflow never runs at all.
+# Both workflows depend on GitHub's scheduler: this watchdog cannot guarantee
+# detection if scheduled GitHub runs are entirely absent. That requires an
+# external monitoring service.
 
 on:
   schedule:
@@ -26,7 +29,7 @@ env:
   # scheduling delay GitHub documents for cron-triggered runs. Note this is
   # the age at which a missing run counts as a problem, not how quickly we
   # notice: the watchdog only looks every 16 hours, so that is the real
-  # upper bound on how long a dead schedule can go unreported.
+  # nominal detection interval, provided the watchdog itself is scheduled.
   STALE_THRESHOLD_MINUTES: 360
   # How many scheduled (not manual) runs to expect in a 24h window at the
   # monitored workflow's 2-hour cadence - shown in the alert message for
@@ -66,6 +69,14 @@ jobs:
           scheduled_24h=$(gh api -X GET "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f "created=>${since}" -f per_page=1)
           scheduled_count_24h=$(echo "$scheduled_24h" | jq -r '.total_count')
 
+          # Handle an empty scheduled window before accessing any latest run.
+          if [ "$scheduled_count_24h" -eq 0 ]; then
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+            echo "reason=0_runs" >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' had 0 runs (scheduled) in the last 24h (expected ~${EXPECTED_SCHEDULED_RUNS_PER_DAY}, every 2h). State: ${state}. GitHub's scheduler appears to have stopped firing it entirely." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           last_scheduled=$(gh api -X GET "repos/${repo}/actions/workflows/${MONITORED_WORKFLOW}/runs" -f event=schedule -f per_page=1)
           last_scheduled_at=$(echo "$last_scheduled" | jq -r '.workflow_runs[0].created_at // empty')
 
@@ -86,8 +97,8 @@ jobs:
           # Count how many of the most recent *completed* runs failed in a row.
           failed_streak=$(echo "$runs" | jq -r '
             [.workflow_runs[] | select(.conclusion != null)]
-            | map(.conclusion)
-            | (index("success") // length)
+            | map(.conclusion == "failure")
+            | (index(false) // length)
           ')
           completed_count=$(echo "$runs" | jq -r '[.workflow_runs[] | select(.conclusion != null)] | length')
 
@@ -108,9 +119,6 @@ jobs:
           elif [ "$minutes_since_scheduled" != "n/a" ] && [ "$minutes_since_scheduled" -gt "$STALE_THRESHOLD_MINUTES" ]; then
             echo "alert=true" >> "$GITHUB_OUTPUT"
             echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't had a *scheduled* run in ${minutes_since_scheduled} minutes (expected every 2h). Last conclusion: ${last_conclusion}. If this persists, try disabling and re-enabling the workflow from the Actions tab - GitHub's scheduler can get stuck." >> "$GITHUB_OUTPUT"
-          elif [ "$scheduled_count_24h" -eq 0 ]; then
-            echo "alert=true" >> "$GITHUB_OUTPUT"
-            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' had zero scheduled runs in the last 24h (expected ~${EXPECTED_SCHEDULED_RUNS_PER_DAY}, every 2h). GitHub's scheduler appears to have stopped firing it entirely." >> "$GITHUB_OUTPUT"
           elif [ "$completed_count" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ] && [ "$failed_streak" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ]; then
             # The workflow is running but every recent run failed. Its own
             # failure notification may be exactly what is broken (bad bot
