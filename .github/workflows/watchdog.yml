@@ -25,12 +25,15 @@ permissions:
 
 env:
   MONITORED_WORKFLOW: check-coin-news.yml
-  # 3x the monitored workflow's 2-hour interval, to absorb the occasional
-  # scheduling delay GitHub documents for cron-triggered runs. Note this is
-  # the age at which a missing run counts as a problem, not how quickly we
-  # notice: the watchdog only looks every 16 hours, so that is the real
-  # nominal detection interval, provided the watchdog itself is scheduled.
-  STALE_THRESHOLD_MINUTES: 360
+  # The cron asks for every 2h, but GitHub's scheduler on this repo
+  # actually fires it only every ~3-8h (gaps of 180-490 min observed over
+  # two weeks in Oct 2026), so a tight threshold just produced a steady
+  # stream of false alarms. 12h is well above the worst observed gap yet
+  # still catches a schedule that has genuinely stalled; a schedule that
+  # stopped completely is also caught by the "0 runs in 24h" check below.
+  # Note this is the age at which a missing run counts as a problem, not
+  # how quickly we notice: the watchdog only looks every 16 hours.
+  STALE_THRESHOLD_MINUTES: 720
   # How many scheduled (not manual) runs to expect in a 24h window at the
   # monitored workflow's 2-hour cadence - shown in the alert message for
   # context. The alert itself only fires on zero: GitHub's scheduler can
@@ -118,7 +121,7 @@ jobs:
             echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' is not active (state: ${state}). GitHub may have auto-disabled it after 60 days without repository activity - re-enable it from the Actions tab." >> "$GITHUB_OUTPUT"
           elif [ "$minutes_since_scheduled" != "n/a" ] && [ "$minutes_since_scheduled" -gt "$STALE_THRESHOLD_MINUTES" ]; then
             echo "alert=true" >> "$GITHUB_OUTPUT"
-            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't had a *scheduled* run in ${minutes_since_scheduled} minutes (expected every 2h). Last conclusion: ${last_conclusion}. If this persists, try disabling and re-enabling the workflow from the Actions tab - GitHub's scheduler can get stuck." >> "$GITHUB_OUTPUT"
+            echo "message=⚠️ Workflow '${MONITORED_WORKFLOW}' hasn't had a *scheduled* run in ${minutes_since_scheduled} minutes (alert threshold: ${STALE_THRESHOLD_MINUTES} min; cron asks for every 2h, GitHub usually delivers every 3-8h). Last conclusion: ${last_conclusion}. If this persists, try disabling and re-enabling the workflow from the Actions tab - GitHub's scheduler can get stuck." >> "$GITHUB_OUTPUT"
           elif [ "$completed_count" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ] && [ "$failed_streak" -ge "$CONSECUTIVE_FAILURES_TO_ALERT" ]; then
             # The workflow is running but every recent run failed. Its own
             # failure notification may be exactly what is broken (bad bot
